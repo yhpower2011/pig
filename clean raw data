@@ -1,0 +1,90 @@
+############################################################
+## 0.  ONE-OFF INSTALLS  (comment out after first run)
+############################################################
+# for (p in c("readxl","dplyr","stringr","janitor","tidyr","writexl"))
+#   if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+# for (p in c("org.Ss.eg.db","UniProt.ws","AnnotationDbi"))
+#   if (!requireNamespace(p, quietly = TRUE))
+#     BiocManager::install(p, ask = FALSE)
+
+############################################################
+## 1.  LOAD LIBRARIES
+############################################################
+library(readxl);  library(janitor);      library(dplyr)
+library(stringr); library(tidyr);        library(writexl)
+library(org.Ss.eg.db);                   library(AnnotationDbi)
+library(UniProt.ws)
+
+############################################################
+## 2.  READ & STANDARDISE
+############################################################
+raw <- read_xlsx("raw data.xlsx") %>%           # <-- adjust file name if needed
+       clean_names()
+
+acc_col <- "protein_ids"                        # header after clean_names()
+
+############################################################
+## 3.  CLEAN  +  SPLIT MULTI-ACCESSION CELLS
+############################################################
+clean <- raw %>%
+  filter(!str_starts(.data[[acc_col]], "CON__"),     # contaminants
+         !str_starts(.data[[acc_col]], "REV__")) %>% # decoys
+  separate_rows(all_of(acc_col), sep = ";") %>%      # explode multi-IDs
+  mutate(uniprot = str_replace(.data[[acc_col]], ";.*", "")) %>%
+  distinct()
+
+############################################################
+## 4.  LOCAL PIG MAPPING
+############################################################
+local_map <- AnnotationDbi::select(
+  org.Ss.eg.db,
+  keys      = clean$uniprot,
+  keytype   = "UNIPROT",
+  columns   = c("SYMBOL","GENENAME"),
+  multiVals = "first"
+)
+
+############################################################
+## 5.  ONLINE RESCUE (if needed)
+############################################################
+need_rescue <- setdiff(clean$uniprot, local_map$UNIPROT)
+if (length(need_rescue) > 0) {
+  up <- UniProt.ws(taxId = 9823)                     # Sus scrofa
+  rescue <- select(up,
+                   keys     = need_rescue,
+                   keytype  = "UNIPROTKB",
+                   columns  = c("GENES","GENENAME")) %>%
+            mutate(SYMBOL = sub(" .*", "", GENES)) %>%
+            distinct(UNIPROTKB, .keep_all = TRUE) %>%
+            rename(UNIPROT = UNIPROTKB)
+  gene_map <- bind_rows(local_map, rescue) %>%
+              distinct(UNIPROT, .keep_all = TRUE)
+} else {
+  gene_map <- local_map
+}
+
+############################################################
+## 6.  MERGE, COLLAPSE BACK TO 642 ROWS, FILL GAPS
+############################################################
+annotated <- clean %>%
+  left_join(gene_map, by = c("uniprot" = "UNIPROT")) %>%
+  relocate(SYMBOL, GENENAME, .after = uniprot) %>%
+  group_by(across(-c(uniprot, SYMBOL, GENENAME))) %>%    # collapse
+  summarise(
+    uniprot  = paste(unique(uniprot),  collapse = ";"),
+    SYMBOL   = paste(unique(na.omit(SYMBOL)),   collapse = "/"),
+    GENENAME = paste(unique(na.omit(GENENAME)), collapse = "/"),
+    .groups  = "drop"
+  ) %>%
+  mutate(
+    SYMBOL   = if_else(SYMBOL   == "", "UNMAPPED", SYMBOL),
+    GENENAME = if_else(GENENAME == "", "UNMAPPED", GENENAME)
+  )
+
+############################################################
+## 7.  WRITE CLEAN OUTPUT
+############################################################
+write_xlsx(annotated, "raw_data_with_genes.xlsx")
+cat("\n✅  Finished.  Output file: raw_data_with_genes.xlsx\n")
