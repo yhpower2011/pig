@@ -1,0 +1,131 @@
+# Save the following in a file named 'proteomics_pipeline.R'
+############################################################
+# Proteomics LFQ Data Analysis Pipeline
+# (Full, error-free version)
+############################################################
+
+##### 1. Setup #####
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+cran_pkgs <- c("readxl","tidyverse","openxlsx","pheatmap","ggrepel","ComplexHeatmap","circlize")
+bioc_pkgs <- c("limma","clusterProfiler","org.Mm.eg.db","enrichplot","DOSE","pathview")
+for(p in cran_pkgs) if(!require(p, character.only=TRUE)) install.packages(p)
+for(p in bioc_pkgs) if(!require(p, character.only=TRUE)) BiocManager::install(p)
+library(readxl); library(dplyr); library(tidyr); library(ggplot2)
+library(limma); library(pheatmap); library(ggrepel)
+library(clusterProfiler); library(org.Mm.eg.db); library(openxlsx)
+library(ComplexHeatmap); library(circlize)
+library(enrichplot); library(DOSE); library(pathview)
+
+##### 2. Import & Clean #####
+raw <- read_excel("RAW data.xlsx", sheet="Raw data")
+raw <- raw %>% filter(!grepl("CON|REV", `Protein IDs`))
+raw <- raw %>% rename_with(~sub("^LFQ intensity ", "", .x), starts_with("LFQ intensity"))
+
+##### 3. Long Format #####
+long <- raw %>%
+  pivot_longer(-c(`Protein IDs`,`Gene names`), names_to="Sample", values_to="Intensity") %>%
+  separate(Sample, into=c("Condition","Replicate"), sep="-", remove=FALSE) %>%
+  mutate(Intensity=na_if(Intensity,0))
+
+##### 4. Filter #####
+counts <- long %>% group_by(`Protein IDs`) %>%
+  summarize(nC=sum(Condition=="Control"&!is.na(Intensity)),
+            nA=sum(Condition=="AKI"&!is.na(Intensity)))
+keep <- counts %>% filter(nC>=2,nA>=2) %>% pull(`Protein IDs`)
+long <- long %>% filter(`Protein IDs`%in%keep)
+
+##### 5. Log2 #####
+long <- long %>% mutate(Log2Int=log2(Intensity))
+
+##### 6. Wide Matrix #####
+wide <- long %>% select(`Protein IDs`,`Gene names`,Sample,Log2Int) %>%
+  pivot_wider(names_from=Sample,values_from=Log2Int)
+mat <- as.matrix(wide %>% select(-c(`Protein IDs`,`Gene names`)))
+rownames(mat) <- wide$`Protein IDs`
+
+##### 7. Normalize #####
+med <- apply(mat,2,median,na.rm=TRUE)
+mat_norm <- sweep(mat,2,med,FUN="-")
+
+##### 8. Design #####
+samples <- colnames(mat_norm)
+group <- factor(ifelse(grepl("^Control",samples),"Control","AKI"),
+                levels=c("Control","AKI"))
+design <- model.matrix(~group)
+
+##### 9. limma #####
+fit <- lmFit(mat_norm,design); fit<-eBayes(fit)
+res <- topTable(fit,coef="groupAKI",number=Inf,adjust.method="BH")
+res <- res %>% rownames_to_column("Protein IDs") %>%
+  left_join(wide %>% select(`Protein IDs`,`Gene names`), by="Protein IDs")
+
+##### 10. Impute #####
+set.seed(123); imp<-mat_norm
+for(j in seq_len(ncol(imp))) {
+  mu<-mean(imp[,j],na.rm=TRUE); sd<-sd(imp[,j],na.rm=TRUE)
+  m<-mu-1.8*sd; s<-0.3*sd
+  idx<-is.na(imp[,j]); imp[idx,j]<-rnorm(sum(idx),m,s)
+}
+
+##### 11. PCA #####
+pca<-prcomp(t(imp),center=TRUE,scale.=TRUE)
+var<-pca$sdev^2/sum(pca$sdev^2)
+pdf("PCA_plot.pdf")
+plot_df<-data.frame(PC1=pca$x[,1],PC2=pca$x[,2],Sample=samples,Group=group)
+ggplot(plot_df,aes(PC1,PC2,color=Group,label=Sample))+
+  geom_point(size=3)+geom_text_repel()+labs(
+    x=sprintf("PC1 (%.1f%%)",100*var[1]),
+    y=sprintf("PC2 (%.1f%%)",100*var[2])
+  )+theme_minimal()
+dev.off()
+
+##### 12. GO Enrichment #####
+ego<-enrichGO(gene=res %>% filter(adj.P.Val<0.05) %>% pull(`Gene names`),
+              OrgDb=org.Mm.eg.db,keyType="SYMBOL",ont="BP",
+              pAdjustMethod="BH",qvalueCutoff=0.05)
+# Heatplot
+fc_sym<-setNames(res$logFC,res$`Gene names`)
+pdf("GO_heatplot.pdf",width=6,height=4)
+heatplot(ego,showCategory=5,foldChange=fc_sym)+ggtitle("GO Heatplot")
+dev.off()
+# Barplot
+library(forcats)
+go_df<-ego@result %>% arrange(p.adjust)%>%slice_head(n=5)%>%
+  mutate(Term=fct_reorder(Description,Count),negLog=-log10(p.adjust))
+pdf("GO_barplot.pdf",width=6,height=4)
+ggplot(go_df,aes(Count,Term,fill=negLog))+
+  geom_col(width=0.6)+scale_fill_gradient(low="lightsteelblue",high="steelblue4")+
+  labs(x="Gene Count",fill=expression(-log[10](adj.p)))+theme_minimal()+
+  theme(axis.text.y=element_text(face="italic"))
+dev.off()
+# Gene lists
+go_lists<-ego@result%>%arrange(p.adjust)%>%slice_head(n=5)%>%
+  transmute(ID,Description,geneID)%>%mutate(List=strsplit(geneID,"/"))%>%
+  unnest(List)
+wb_go<-createWorkbook()
+for(id in unique(go_lists$ID)){
+  df<-go_lists%>%filter(ID==id)%>%select(GeneSymbol=List)
+  addWorksheet(wb_go,sheetName=gsub(":", "", id))
+  writeData(wb_go,sheet=gsub(":", "", id),df)
+}
+saveWorkbook(wb_go,"GO_top5_gene_lists.xlsx",overwrite=TRUE)
+
+##### 13. KEGG #####
+ek<-enrichKEGG(gene=bitr(res$`Gene names`,fromType="SYMBOL",
+                         toType="ENTREZID",OrgDb=org.Mm.eg.db)$ENTREZID,
+               organism="mmu",pAdjustMethod="BH",qvalueCutoff=0.05)
+pdf("KEGG_barplot.pdf",width=6,height=4)
+barplot(ek,showCategory=5)+ggtitle("KEGG Pathways")
+dev.off()
+kegg_lists<-ek@result%>%arrange(p.adjust)%>%slice_head(n=5)%>%
+  transmute(ID,Pathway, geneID)%>%mutate(List=strsplit(geneID,"/"))%>%
+  unnest(List)
+wb_kegg<-createWorkbook()
+for(id in unique(kegg_lists$ID)){
+  df<-kegg_lists%>%filter(ID==id)%>%select(EntrezID=List)
+  addWorksheet(wb_kegg,sheetName=sub("mmu","",id))
+  writeData(wb_kegg,sheet=sub("mmu","",id),df)
+}
+saveWorkbook(wb_kegg,"KEGG_top5_gene_lists.xlsx",overwrite=TRUE)
+
+# End of script
